@@ -1,132 +1,80 @@
-const express = require("express");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
-const { google } = require("googleapis");
-const cors = require("cors");
+// server.js
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const { google } = require('googleapis');
+const path = require('path');
 
 const app = express();
-app.use(cors());
-const upload = multer({ dest: "uploads/" });
+const upload = multer({ dest: 'uploads/' });
 
-// Required environment variables (set these in Render)
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI; // e.g. https://your-app.onrender.com/oauth2callback
-const REFRESH_TOKEN = process.env.REFRESH_TOKEN; // will be set after you obtain it
-const UPLOAD_KEY = process.env.UPLOAD_KEY; // secret shared with your Sketchware app
+// Basic health check
+app.get('/', (req, res) => res.send('YouTube uploader is running'));
 
-if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) {
-  console.error("Missing CLIENT_ID, CLIENT_SECRET or REDIRECT_URI in env.");
-}
-
-// OAuth2 client
-const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-if (REFRESH_TOKEN) {
-  oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
-}
-
-// Helper to build youtube client
-function getYouTube() {
-  return google.youtube({
-    version: "v3",
-    auth: oauth2Client
-  });
-}
-
-// ========== Optional: route to start OAuth (use only if you want to auth via this server) ==========
-app.get("/auth", (req, res) => {
-  const url = oauth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: ["https://www.googleapis.com/auth/youtube.upload"]
-  });
-  res.redirect(url);
-});
-
-// OAuth2 callback — Google will redirect here with ?code=...
-// Use this only for initial token fetch (you'll copy refresh_token and put it into Render env)
-app.get("/oauth2callback", async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.status(400).send("Missing code");
+// POST /uploadToYouTube
+app.post('/uploadToYouTube', upload.single('video'), async (req, res) => {
   try {
-    const { tokens } = await oauth2Client.getToken(code);
-    // tokens.refresh_token will be present the first time consented
-    // IMPORTANT: copy tokens.refresh_token and put it into Render env (REFRESH_TOKEN)
-    res.send({
-      message: "OK — copy the refresh_token value and add it to Render ENV as REFRESH_TOKEN",
-      tokens: tokens
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Token exchange failed");
-  }
-});
+    if (!req.file) return res.status(400).json({ success: false, error: 'No video file uploaded' });
 
-// Simple healthcheck
-app.get("/", (req, res) => res.send("YouTube uploader backend alive"));
+    const title = req.body.title || 'Uploaded from app';
+    const description = req.body.description || '';
 
-// ========== Upload endpoint ==========
-app.post("/upload", upload.single("video"), async (req, res) => {
-  try {
-    // Basic protection: require upload secret header
-    const key = req.get("x-api-key") || req.headers["x-api-key"];
-    if (!UPLOAD_KEY || key !== UPLOAD_KEY) {
-      // drop uploaded file if present
-      if (req.file && req.file.path) fs.unlinkSync(req.file.path);
-      return res.status(401).json({ error: "Unauthorized" });
+    // Load OAuth info from environment variables
+    const CLIENT_ID = process.env.YT_CLIENT_ID;
+    const CLIENT_SECRET = process.env.YT_CLIENT_SECRET;
+    const REDIRECT_URI = process.env.YT_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob';
+    const REFRESH_TOKEN = process.env.YT_REFRESH_TOKEN;
+
+    if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+      // Clean up file
+      fs.unlinkSync(req.file.path);
+      return res.status(500).json({ success: false, error: 'Missing YouTube OAuth environment variables' });
     }
 
-    if (!REFRESH_TOKEN) {
-      if (req.file && req.file.path) fs.unlinkSync(req.file.path);
-      return res.status(500).json({ error: "Server not configured with REFRESH_TOKEN" });
-    }
-
-    // Ensure OAuth client has refresh token
+    // Setup OAuth2 client
+    const oauth2Client = new google.auth.OAuth2(
+      CLIENT_ID,
+      CLIENT_SECRET,
+      REDIRECT_URI
+    );
     oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
 
-    const youtube = getYouTube();
+    const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
-    const { title = "Untitled", description = "" } = req.body;
-    const filePath = req.file.path;
-
-    // Upload - using media stream
+    // Upload video to YouTube
+    const filePath = path.resolve(req.file.path);
     const response = await youtube.videos.insert({
-      part: ["snippet", "status"],
+      part: 'snippet,status',
       requestBody: {
         snippet: {
-          title: title,
-          description: description
+          title,
+          description
         },
         status: {
-          privacyStatus: "unlisted"
+          privacyStatus: 'public'
         }
       },
       media: {
         body: fs.createReadStream(filePath)
       }
+    }, {
+      // Set a high timeout for large files
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
     });
 
-    // remove temp file
+    // Remove temp file
     fs.unlinkSync(filePath);
 
-    const videoId = response.data.id;
-    res.json({
-      success: true,
-      videoId: videoId,
-      url: `https://youtu.be/${videoId}`,
-      raw: response.data
-    });
+    res.json({ success: true, videoId: response.data.id, data: response.data });
   } catch (err) {
-    console.error("Upload error:", err);
-    // cleanup
-    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
-      try { fs.unlinkSync(req.file.path); } catch (e) {}
-    }
-    res.status(500).json({ error: err.message || "Upload failed" });
+    console.error('Upload error', err);
+    // cleanup temp file if exists
+    try { if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch (e) {}
+    res.status(500).json({ success: false, error: err.message || String(err) });
   }
 });
 
+// Start server on Render's provided PORT or 3000 locally
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
+app.listen(port, () => console.log(`Server listening on ${port}`));
